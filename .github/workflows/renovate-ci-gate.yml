@@ -1,0 +1,76 @@
+name: renovate-ci-gate
+
+on:
+  workflow_call:
+    inputs:
+      base_branch:
+        description: Branch where Renovate merge commits should skip CI
+        required: false
+        type: string
+        default: master
+    outputs:
+      run_ci:
+        description: Should CI run
+        value: ${{ jobs.decide.outputs.run_ci }}
+
+jobs:
+  decide:
+    name: Decide whether CI should run
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      run_ci: ${{ steps.check.outputs.run_ci }}
+
+    steps:
+      - name: Check if CI should run
+        id: check
+        uses: actions/github-script@v9
+        env:
+          BASE_BRANCH: ${{ inputs.base_branch }}
+        with:
+          script: |
+            const eventName = context.eventName;
+            const ref = context.ref;
+            const sha = context.sha;
+            const baseRef = `refs/heads/${process.env.BASE_BRANCH}`;
+            const headCommitMessage = context.payload.head_commit?.message || '';
+
+            if (
+              eventName === 'push' &&
+              ref === baseRef &&
+              headCommitMessage.startsWith('chore: release v')
+            ) {
+              core.setOutput('run_ci', 'false');
+              return;
+            }
+
+            if (eventName === 'pull_request') {
+              core.setOutput('run_ci', 'true');
+              return;
+            }
+
+            if (eventName === 'push' && ref === baseRef) {
+              const { owner, repo } = context.repo;
+
+              const { data: prs } =
+                await github.rest.repos.listPullRequestsAssociatedWithCommit({
+                  owner,
+                  repo,
+                  commit_sha: sha,
+                });
+
+              const isRenovatePr = prs.some((pr) => {
+                const byRenovateBot = pr.user?.login === 'renovate[bot]';
+                const fromRenovateBranch =
+                  typeof pr.head?.ref === 'string' &&
+                  pr.head.ref.startsWith('renovate/');
+                return byRenovateBot || fromRenovateBranch;
+              });
+
+              core.setOutput('run_ci', isRenovatePr ? 'false' : 'true');
+              return;
+            }
+
+            core.setOutput('run_ci', 'true');

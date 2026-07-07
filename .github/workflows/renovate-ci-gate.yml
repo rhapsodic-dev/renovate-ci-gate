@@ -8,10 +8,18 @@ on:
         required: false
         type: string
         default: master
+      release_commit_prefix:
+        description: Prefix for release commits that should skip CI
+        required: false
+        type: string
+        default: "chore: release v"
     outputs:
       run_ci:
         description: Should CI run
         value: ${{ jobs.decide.outputs.run_ci }}
+      reason:
+        description: Why the gate made its decision
+        value: ${{ jobs.decide.outputs.reason }}
 
 jobs:
   decide:
@@ -22,6 +30,7 @@ jobs:
       pull-requests: read
     outputs:
       run_ci: ${{ steps.check.outputs.run_ci }}
+      reason: ${{ steps.check.outputs.reason }}
 
     steps:
       - name: Check if CI should run
@@ -29,48 +38,99 @@ jobs:
         uses: actions/github-script@v9
         env:
           BASE_BRANCH: ${{ inputs.base_branch }}
+          RELEASE_COMMIT_PREFIX: ${{ inputs.release_commit_prefix }}
         with:
           script: |
             const eventName = context.eventName;
             const ref = context.ref;
             const sha = context.sha;
             const baseRef = `refs/heads/${process.env.BASE_BRANCH}`;
-            const headCommitMessage = context.payload.head_commit?.message || '';
+            const releaseCommitPrefix =
+              process.env.RELEASE_COMMIT_PREFIX || 'chore: release v';
+            const { owner, repo } = context.repo;
 
-            if (
-              eventName === 'push' &&
-              ref === baseRef &&
-              headCommitMessage.startsWith('chore: release v')
-            ) {
-              core.setOutput('run_ci', 'false');
-              return;
-            }
+            const decide = (runCi, reason) => {
+              core.setOutput('run_ci', runCi);
+              core.setOutput('reason', reason);
+              core.notice(`run_ci=${runCi} reason=${reason}`);
+            };
+
+            const escapeRegExp = (value) =>
+              value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+            const releaseCommitPattern = new RegExp(
+              `^${escapeRegExp(releaseCommitPrefix)}` +
+                String.raw`\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?(?:\n|$)`,
+            );
+
+            core.info(`event=${eventName}`);
+            core.info(`ref=${ref}`);
+            core.info(`baseRef=${baseRef}`);
+            core.info(`sha=${sha}`);
+            core.info(`releaseCommitPrefix=${JSON.stringify(releaseCommitPrefix)}`);
 
             if (eventName === 'pull_request') {
-              core.setOutput('run_ci', 'true');
+              decide('true', 'pull_request');
               return;
             }
 
-            if (eventName === 'push' && ref === baseRef) {
-              const { owner, repo } = context.repo;
+            if (eventName !== 'push') {
+              decide('true', 'default');
+              return;
+            }
 
-              const { data: prs } =
-                await github.rest.repos.listPullRequestsAssociatedWithCommit({
-                  owner,
-                  repo,
-                  commit_sha: sha,
-                });
+            if (ref !== baseRef) {
+              decide('true', 'non_base_ref');
+              return;
+            }
 
-              const isRenovatePr = prs.some((pr) => {
-                const byRenovateBot = pr.user?.login === 'renovate[bot]';
-                const fromRenovateBranch =
-                  typeof pr.head?.ref === 'string' &&
-                  pr.head.ref.startsWith('renovate/');
-                return byRenovateBot || fromRenovateBranch;
+            const payloadCommits = Array.isArray(context.payload.commits)
+              ? context.payload.commits
+              : [];
+            const payloadCommitMessage =
+              context.payload.head_commit?.message ||
+              payloadCommits.find((commit) => commit.id === sha)?.message ||
+              '';
+
+            let headCommitMessage = payloadCommitMessage;
+            if (!headCommitMessage) {
+              const { data: commit } = await github.rest.repos.getCommit({
+                owner,
+                repo,
+                ref: sha,
+              });
+              headCommitMessage = commit.commit?.message || '';
+            }
+            const normalizedHeadCommitMessage = headCommitMessage.trimStart();
+
+            core.info(`headCommitMessage=${JSON.stringify(headCommitMessage)}`);
+            core.info(
+              `normalizedHeadCommitMessage=${JSON.stringify(
+                normalizedHeadCommitMessage,
+              )}`,
+            );
+
+            if (releaseCommitPattern.test(normalizedHeadCommitMessage)) {
+              decide('false', 'release_commit');
+              return;
+            }
+
+            const { data: prs } =
+              await github.rest.repos.listPullRequestsAssociatedWithCommit({
+                owner,
+                repo,
+                commit_sha: sha,
               });
 
-              core.setOutput('run_ci', isRenovatePr ? 'false' : 'true');
-              return;
-            }
+            const isRenovatePr = prs.some((pr) => {
+              const byRenovateBot = pr.user?.login === 'renovate[bot]';
+              const fromRenovateBranch =
+                typeof pr.head?.ref === 'string' &&
+                pr.head.ref.startsWith('renovate/');
+              return byRenovateBot || fromRenovateBranch;
+            });
 
-            core.setOutput('run_ci', 'true');
+            decide(
+              isRenovatePr ? 'false' : 'true',
+              isRenovatePr ? 'renovate_pr' : 'default',
+            );
